@@ -34,10 +34,35 @@ export interface DoclightMcp {
     sessionId: string,
     fn: () => Promise<T>,
   ): Promise<T>
-  /** Flush all buffered events immediately. */
+  /** Flush all buffered events immediately. Never rejects. */
   flush(): Promise<void>
-  /** Flush and shut down the underlying transport. */
+  /** Flush and shut down the underlying transport. Never rejects. */
   shutdown(): Promise<void>
+}
+
+/** Maximum events the ingest backend accepts in one batch request. */
+export const MAX_INGEST_BATCH_EVENTS = 500
+
+function safely(fn: () => void): void {
+  try {
+    fn()
+  } catch {
+    // Telemetry must never change application behavior.
+  }
+}
+
+function errorClass(err: unknown): string {
+  if (err instanceof Error && err.name) return err.name
+  return "UnknownError"
+}
+
+/** MCP reports tool failures as a result with `isError: true` instead of throwing. */
+function isErrorResult(result: unknown): boolean {
+  return (
+    typeof result === "object" &&
+    result !== null &&
+    (result as { isError?: unknown }).isError === true
+  )
 }
 
 /**
@@ -45,10 +70,21 @@ export interface DoclightMcp {
  *
  * Lifecycle hooks are **disabled** by default so the MCP server process owns
  * its own shutdown sequence. Pass `lifecycleHooks: true` to re-enable them.
+ *
+ * Telemetry is best effort: no method here throws or rejects because of a
+ * telemetry failure, and nothing is ever written to stdout (stdio-safe).
+ * `transport.batchSize` counts events (about 3 per tool call) and must not
+ * exceed {@link MAX_INGEST_BATCH_EVENTS}.
  */
 export function createDoclightMcp(
   config: DoclightMcpConfig,
 ): DoclightMcp {
+  const batchSize = config.transport?.batchSize
+  if (batchSize !== undefined && batchSize > MAX_INGEST_BATCH_EVENTS) {
+    throw new RangeError(
+      `transport.batchSize (${batchSize}) exceeds the ingest limit of ${MAX_INGEST_BATCH_EVENTS} events per batch`,
+    )
+  }
   const client = createDoclight({ lifecycleHooks: false, ...config })
 
   return {
@@ -59,7 +95,7 @@ export function createDoclightMcp(
     },
 
     endSession(sessionId: string, outcome: ToolOutcome): void {
-      client.endSession(sessionId, outcome)
+      safely(() => client.endSession(sessionId, outcome))
     },
 
     async trackTool<T>(
@@ -68,95 +104,148 @@ export function createDoclightMcp(
       fn: () => Promise<T>,
     ): Promise<T> {
       const start = Date.now()
+      let result: T
       try {
-        const result = await fn()
-        client.trackToolCall({
-          sessionId,
-          toolName,
-          status: "success",
-          durationMs: Date.now() - start,
-        })
-        return result
+        result = await fn()
       } catch (err) {
-        client.trackToolCall({
-          sessionId,
-          toolName,
-          status: "failed",
-          durationMs: Date.now() - start,
+        const durationMs = Date.now() - start
+        safely(() => {
+          client.trackToolCall({
+            sessionId,
+            toolName,
+            status: "failed",
+            durationMs,
+            errorType: errorClass(err),
+          })
         })
         throw err
       }
+      const failed = isErrorResult(result)
+      const durationMs = Date.now() - start
+      safely(() => {
+        client.trackToolCall({
+          sessionId,
+          toolName,
+          status: failed ? "failed" : "success",
+          durationMs,
+          ...(failed ? { errorType: "ToolErrorResult" } : {}),
+        })
+      })
+      return result
     },
 
-    flush(): Promise<void> {
-      return client.flush()
+    async flush(): Promise<void> {
+      try {
+        await client.flush()
+      } catch {
+        // best effort
+      }
     },
 
-    shutdown(): Promise<void> {
-      return client.shutdown()
+    async shutdown(): Promise<void> {
+      try {
+        await client.shutdown()
+      } catch {
+        // best effort
+      }
     },
   }
 }
 
 type AnyHandler = (...args: unknown[]) => unknown
 
-// Minimal duck-typed interface for the private McpServer internals we access.
+// Minimal duck-typed interface for the McpServer internals we access.
 interface McpServerInternals {
   tool: (...args: unknown[]) => unknown
   registerTool: (name: string, config: unknown, cb: AnyHandler) => unknown
-  _registeredTools?: Record<string, { handler: AnyHandler }>
+  _registeredTools?: Record<string, { handler: unknown }>
+}
+
+const WRAPPED = Symbol.for("@doclight/mcp.wrapped")
+const instrumented = new WeakMap<object, DoclightMcp>()
+
+/**
+ * Return the {@link DoclightMcp} context attached to a server by
+ * {@link withDoclight}, e.g. to `flush()` / `shutdown()` it. `undefined` if the
+ * server was never instrumented.
+ */
+export function getDoclightMcp(server: McpServer): DoclightMcp | undefined {
+  return instrumented.get(server)
 }
 
 /**
- * Instrument a {@link McpServer} with Doclight observability in two lines.
+ * Instrument a {@link McpServer} with Doclight observability.
  *
- * Monkey-patches `server.tool()` and `server.registerTool()` so every handler
- * — registered **before or after** this call — is automatically wrapped with a
- * Doclight session that records duration and outcome for every tool invocation.
+ * Wraps handlers registered through `server.tool()` and
+ * `server.registerTool()` — both those registered **before** and **after**
+ * this call. Each invocation records one session with its duration and
+ * success/failed outcome (thrown errors and MCP `isError: true` results both
+ * count as failed). Arguments, results and error messages are never captured.
  *
- * ```ts
- * const server = new McpServer({ name: "my-server", version: "1.0.0" })
+ * Calling `withDoclight` again on the same server is a no-op: the server keeps
+ * its first instrumentation and the original `config` of that call.
  *
- * withDoclight(server, {
- *   apiKey: process.env.DOCLIGHT_API_KEY!,
- *   projectId: process.env.DOCLIGHT_PROJECT_ID!,
- * })
+ * Ownership: this function does not register signal handlers. The caller owns
+ * shutdown and should `await getDoclightMcp(server)?.shutdown()` before exit.
  *
- * // All tools registered below are automatically instrumented:
- * server.tool("my_tool", { q: z.string() }, async ({ q }) => { ... })
- * ```
+ * Limitations: handlers swapped later via `registeredTool.update({ callback })`
+ * or task-based tools (`registerToolTask`) are not wrapped.
  *
- * Returns the same server instance so the call can be chained.
+ * Compatibility: tested against `@modelcontextprotocol/sdk` ^1.12 (peer range
+ * `>=1.12.0`); it relies on the `McpServer` internals `_registeredTools`,
+ * `tool` and `registerTool`. The low-level `Server` class is not supported.
  */
 export function withDoclight(
   server: McpServer,
   config: DoclightMcpConfig,
 ): McpServer {
-  const mcp = createDoclightMcp(config)
+  if (instrumented.has(server)) return server
+
   const srv = server as unknown as McpServerInternals
+  if (
+    typeof srv.tool !== "function" ||
+    typeof srv.registerTool !== "function"
+  ) {
+    throw new TypeError(
+      "withDoclight expects an McpServer (the low-level Server class is not supported)",
+    )
+  }
+
+  const mcp = createDoclightMcp(config)
+  instrumented.set(server, mcp)
 
   function wrapHandler(toolName: string, handler: AnyHandler): AnyHandler {
-    return async (...args: unknown[]) => {
-      const sessionId = mcp.startSession(toolName)
-      try {
-        const result = await mcp.trackTool(
-          toolName,
-          sessionId,
-          () => handler(...args) as Promise<unknown>,
+    if (typeof handler !== "function") return handler
+    if ((handler as unknown as Record<symbol, unknown>)[WRAPPED]) return handler
+
+    const wrapped = function (this: unknown, ...args: unknown[]) {
+      let sessionId: string | undefined
+      safely(() => {
+        sessionId = mcp.startSession(toolName)
+      })
+      if (sessionId === undefined) return handler.apply(this, args)
+      const sid = sessionId
+      return mcp
+        .trackTool(toolName, sid, async () => handler.apply(this, args))
+        .then(
+          (result) => {
+            mcp.endSession(sid, isErrorResult(result) ? "failed" : "success")
+            return result
+          },
+          (err: unknown) => {
+            mcp.endSession(sid, "failed")
+            throw err
+          },
         )
-        mcp.endSession(sessionId, "success")
-        return result
-      } catch (err) {
-        mcp.endSession(sessionId, "failed")
-        throw err
-      }
     }
+    Object.defineProperty(wrapped, WRAPPED, { value: true })
+    return wrapped
   }
 
   // Wrap handlers that were registered BEFORE this call.
   if (srv._registeredTools) {
     for (const [toolName, registered] of Object.entries(srv._registeredTools)) {
-      registered.handler = wrapHandler(toolName, registered.handler)
+      registered.handler = wrapHandler(toolName, registered.handler as AnyHandler)
     }
   }
 
@@ -165,17 +254,17 @@ export function withDoclight(
   // handler last.
   const origTool = srv.tool.bind(server)
   srv.tool = (...args: unknown[]) => {
-    const toolName = args[0] as string
     const lastIdx = args.length - 1
-    args[lastIdx] = wrapHandler(toolName, args[lastIdx] as AnyHandler)
+    if (lastIdx >= 1 && typeof args[0] === "string") {
+      args[lastIdx] = wrapHandler(args[0], args[lastIdx] as AnyHandler)
+    }
     return origTool(...args)
   }
 
   // Also intercept the newer registerTool(name, config, cb) API.
   const origRegisterTool = srv.registerTool.bind(server)
-  srv.registerTool = (name: string, config: unknown, cb: AnyHandler) => {
-    return origRegisterTool(name, config, wrapHandler(name, cb))
-  }
+  srv.registerTool = (name: string, toolConfig: unknown, cb: AnyHandler) =>
+    origRegisterTool(name, toolConfig, wrapHandler(name, cb))
 
   return server
 }

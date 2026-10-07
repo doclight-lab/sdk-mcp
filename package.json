@@ -42,7 +42,7 @@
   },
   "packageManager": "pnpm@10.18.0",
   "peerDependencies": {
-    "@modelcontextprotocol/sdk": ">=1.0.0"
+    "@modelcontextprotocol/sdk": ">=1.12.0"
   },
   "peerDependenciesMeta": {
     "@modelcontextprotocol/sdk": {
