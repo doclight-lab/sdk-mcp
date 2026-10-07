@@ -1,0 +1,40 @@
+name: Merge readiness
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '*/15 * * * *'
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+  pull_request_review:
+    types: [submitted, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  issue_comment:
+    types: [created, edited, deleted]
+  workflow_run:
+    workflows: [Automation CI]
+    types: [completed]
+permissions:
+  contents: read
+concurrency:
+  group: merge-readiness-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  merge-ready-evaluate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        env:
+          MERGE_READY_REQUIRED_APPROVALS: ${{ vars.MERGE_READY_REQUIRED_APPROVALS }}
+          MERGE_READY_FRESH_APPROVALS: ${{ vars.MERGE_READY_FRESH_APPROVALS }}
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            if (require('node:fs').existsSync('.github/scripts/merge_ready.cjs')) {
+              await require('./.github/scripts/merge_ready.cjs').run({github,context,core});
+            } else core.info('Bootstrap: controller not on main yet.');

@@ -1,13 +1,15 @@
-name: CI
+name: Automation CI
 on:
   push:
     branches: [main]
   pull_request:
     branches: [main]
-
+permissions:
+  contents: read
 jobs:
-  ci:
+  sdk:
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
       - uses: pnpm/action-setup@v4
@@ -15,7 +17,9 @@ jobs:
         with:
           node-version: 20
           cache: pnpm
+      - run: node --test .github/scripts/*.test.cjs
       - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
       - run: pnpm typecheck
       - run: pnpm build
       - run: pnpm test
