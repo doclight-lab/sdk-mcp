@@ -8,46 +8,54 @@ Automatic instrumentation for [MCP](https://modelcontextprotocol.io) servers via
 npm install @doclight/mcp
 ```
 
+## Compatibility
+
+- `@modelcontextprotocol/sdk` `>=1.12.0` (tested against 1.29). Supported API: **`McpServer`** with `server.tool()` and `server.registerTool()`.
+- `withDoclight` relies on `McpServer` internals (`_registeredTools`), so a future SDK major may need an update.
+- The low-level `Server` class (`setRequestHandler`) is **not** auto-instrumented; use the manual quickstart below.
+- Not wrapped: handlers swapped later via `registeredTool.update({ callback })` and task-based tools (`registerToolTask`).
+
 ## Before / after
 
 ```ts
-// Before — plain MCP server
-import { Server } from "@modelcontextprotocol/sdk/server/index.js"
-const server = new Server({ name: "my-server", version: "1.0.0" })
-server.setRequestHandler(CallToolRequestSchema, handler)
+import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
+import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js"
+import { withDoclight, getDoclightMcp } from "@doclight/mcp"
 
-// After — automatic instrumentation (+2 lines)
-import { withDoclight } from "@doclight/mcp"
-const server = withDoclight(new Server({ name: "my-server", version: "1.0.0" }), {
+// Before — plain MCP server
+const server = new McpServer({ name: "my-server", version: "1.0.0" })
+
+// After — automatic instrumentation (+1 call)
+withDoclight(server, {
   apiKey: process.env.DOCLIGHT_API_KEY!,
   projectId: process.env.DOCLIGHT_PROJECT_ID!,
 })
-server.setRequestHandler(CallToolRequestSchema, handler)
+
+// Tools registered before OR after withDoclight() are instrumented.
+server.registerTool("my_tool", { description: "..." }, async () => ({
+  content: [{ type: "text", text: "ok" }],
+}))
+
+await server.connect(new StdioServerTransport())
+
+// You own shutdown: flush buffered events before exiting.
+process.on("SIGINT", async () => {
+  await getDoclightMcp(server)?.shutdown()
+  process.exit(0)
+})
 ```
 
-`withDoclight` monkey-patches all tool handlers on the server instance to automatically open a session, record timing and outcome, and close the session for every tool call.
+`withDoclight` wraps tool handlers so every call records a session, its duration and its outcome. Handler arguments, return values, `this` and thrown errors are passed through unchanged, and telemetry failures never affect tool behavior. Calling `withDoclight` again on the same server is a no-op (no duplicate telemetry).
 
-## What NEVER Gets Captured
+Outcome: a thrown error **or** an MCP result with `isError: true` is recorded as `failed`; otherwise `success`.
 
-- Tool input arguments
-- Tool output / response content
-- Prompt text or user messages
-- Any secrets or credentials
+## Flush / shutdown ownership
 
-## What gets instrumented automatically
+`withDoclight` registers **no** process signal handlers and writes nothing to stdout, so it cannot corrupt the stdio JSON-RPC stream. The application owns lifecycle: call `getDoclightMcp(server)?.flush()` or `.shutdown()` (both never reject) before exit. With `createDoclightMcp` use `mcp.flush()` / `mcp.shutdown()`.
 
-| Event type | Trigger | Key fields |
-| --- | --- | --- |
-| `session_started` | Tool call begins | `goal` = tool name |
-| `tool_called` | Tool handler runs | `toolName`, `durationMs`, `status` |
-| `session_completed` | Tool call returns | `outcome` = success/failed/timeout |
-| `error_occurred` | Handler throws | `errorType`, `errorMessage` |
+## Batch limits
 
-## Session lifecycle
-
-**stdio transport**: One session per tool call (session_started → tool_called → session_completed). The process lifetime may span many sessions — each tool invocation is independent.
-
-**HTTP transport**: Same single-call lifecycle. Sessions are independent between requests; there is no shared session across concurrent HTTP calls.
+The ingest backend accepts at most 500 events per batch. Each tool call emits about 3 events, so `transport.batchSize` (counted in events) must be `<= 500`; larger values throw a `RangeError`. These tool/session batches are separate from website telemetry sent by other Doclight SDKs.
 
 ## Manual quickstart (without `withDoclight`)
 
@@ -66,15 +74,18 @@ const server = new Server({ name: "my-mcp-server", version: "1.0.0" })
 
 server.setRequestHandler(CallToolRequestSchema, async (request) => {
   const sessionId = mcp.startSession(request.params.name)
-
-  const result = await mcp.trackTool(
-    request.params.name,
-    sessionId,
-    () => runTool(request.params),
-  )
-
-  mcp.endSession(sessionId, "success")
-  return result
+  try {
+    const result = await mcp.trackTool(
+      request.params.name,
+      sessionId,
+      () => runTool(request.params),
+    )
+    mcp.endSession(sessionId, "success")
+    return result
+  } catch (err) {
+    mcp.endSession(sessionId, "failed")
+    throw err
+  }
 })
 
 const transport = new StdioServerTransport()
@@ -88,6 +99,10 @@ process.on("SIGINT", async () => {
 
 ## API
 
+### `getDoclightMcp(server)`
+
+Returns the context attached by `withDoclight`, or `undefined`.
+
 ### `createDoclightMcp(config)`
 
 Returns a `DoclightMcp` context. Lifecycle hooks are disabled by default so the MCP server process owns its own shutdown sequence. Pass `lifecycleHooks: true` to re-enable them.
@@ -97,8 +112,8 @@ Returns a `DoclightMcp` context. Lifecycle hooks are disabled by default so the 
 | `startSession(goal?)` | Open a new session; returns `sessionId` |
 | `endSession(sessionId, outcome)` | Close the session |
 | `trackTool(name, sessionId, fn)` | Run `fn`, record duration + outcome |
-| `flush()` | Flush buffered events immediately |
-| `shutdown()` | Flush and close the transport |
+| `flush()` | Flush buffered events immediately (never rejects) |
+| `shutdown()` | Flush and close the transport (never rejects) |
 | `client` | The underlying `Doclight` instance |
 
 ---

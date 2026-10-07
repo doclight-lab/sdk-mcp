@@ -13,7 +13,7 @@ import {
 } from "node:http"
 import type { AddressInfo } from "node:net"
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js"
-import { withDoclight } from "./index"
+import { createDoclightMcp, getDoclightMcp, withDoclight } from "./index"
 
 const API_KEY = "dl_mcp_test"
 const PROJECT_ID = "proj_mcp_test"
@@ -178,26 +178,152 @@ describe("withDoclight()", () => {
     expect(ev?.status).toBe("failed")
   })
 
-  it("does not double-wrap when called twice with the same pre-registered tool", async () => {
+  it("does not double-wrap when withDoclight() is called twice", async () => {
     const server = makeServer()
-
     server.tool("shared_tool", async () => ({
       content: [{ type: "text" as const, text: "x" }],
     }))
 
-    // Two independent clients both wrap the pre-registered handler.
-    // The second call should detect the already-wrapped handler and skip.
     withDoclight(server, cfg(sink.baseUrl))
     withDoclight(server, cfg(sink.baseUrl))
+    server.tool("late_tool", async () => ({ content: [] }))
 
     await callTool(server, "shared_tool")
-    await new Promise((r) => setTimeout(r, 200))
+    await callTool(server, "late_tool")
+    await getDoclightMcp(server)!.flush()
 
-    // Each withDoclight() creates its own client, so 2 tool_called events
-    // is expected — one per instrumentation layer. Without the DOCLIGHT_WRAPPED
-    // guard, the second layer's wrap of an already-wrapped handler would
-    // produce 3 events (outer → inner → original).
-    const hits = toolCalledEvents(sink).filter((e) => e.toolName === "shared_tool")
-    expect(hits.length).toBe(2)
+    const hits = toolCalledEvents(sink)
+    expect(hits.filter((e) => e.toolName === "shared_tool")).toHaveLength(1)
+    expect(hits.filter((e) => e.toolName === "late_tool")).toHaveLength(1)
+  })
+
+  it("wraps registerTool() and preserves arguments, result and this", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    const seen: unknown[] = []
+    const result = { content: [{ type: "text" as const, text: "r" }] }
+    server.registerTool(
+      "reg_tool",
+      { description: "d" },
+      async (extra: unknown) => {
+        seen.push(extra)
+        return result
+      },
+    )
+    const extra = { marker: 1 }
+    const tools = (server as unknown as {
+      _registeredTools: Record<string, { handler: (e: unknown) => Promise<unknown> }>
+    })._registeredTools
+    const out = await tools.reg_tool!.handler(extra)
+    expect(out).toBe(result)
+    expect(seen[0]).toBe(extra)
+    await getDoclightMcp(server)!.flush()
+    const ev = toolCalledEvents(sink).find((e) => e.toolName === "reg_tool")
+    expect(ev?.status).toBe("success")
+  })
+
+  it("records MCP isError results as failed without capturing content", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    const result = {
+      isError: true,
+      content: [{ type: "text" as const, text: "token=sk-supersecret" }],
+    }
+    server.tool("err_result", async () => result)
+    expect(await callTool(server, "err_result")).toBe(result)
+    await getDoclightMcp(server)!.flush()
+    const ev = toolCalledEvents(sink).find((e) => e.toolName === "err_result")
+    expect(ev?.status).toBe("failed")
+    expect(JSON.stringify(sink.events)).not.toContain("sk-supersecret")
+  })
+
+  it("does not capture thrown error messages", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    server.tool("throws", async () => {
+      throw new TypeError("password=hunter2")
+    })
+    await expect(callTool(server, "throws")).rejects.toThrow("password=hunter2")
+    await getDoclightMcp(server)!.flush()
+    expect(JSON.stringify(sink.events)).not.toContain("hunter2")
+  })
+
+  it("isolates concurrent calls into separate sessions", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    server.tool("slow", async () => {
+      await new Promise((r) => setTimeout(r, 20))
+      return { content: [] }
+    })
+    server.tool("boom", async () => {
+      throw new Error("x")
+    })
+    await Promise.allSettled([
+      callTool(server, "slow"),
+      callTool(server, "slow"),
+      callTool(server, "boom"),
+    ])
+    await getDoclightMcp(server)!.flush()
+    const calls = toolCalledEvents(sink)
+    expect(calls).toHaveLength(3)
+    expect(new Set(calls.map((e) => e.sessionId as string)).size).toBe(3)
+    expect(calls.filter((e) => e.status === "failed")).toHaveLength(1)
+  })
+
+  it("does not break tools when telemetry fails", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    const mcp = getDoclightMcp(server)!
+    const boom = () => {
+      throw new Error("telemetry down")
+    }
+    mcp.client.startSession = boom
+    mcp.client.trackToolCall = boom
+    mcp.client.endSession = boom
+    server.tool("ok_tool", async () => ({ content: [] }))
+    server.tool("bad_tool", async () => {
+      throw new Error("app error")
+    })
+    await expect(callTool(server, "ok_tool")).resolves.toEqual({ content: [] })
+    await expect(callTool(server, "bad_tool")).rejects.toThrow("app error")
+  })
+
+  it("leaves non-function (task) handlers untouched", () => {
+    const server = makeServer()
+    const taskHandler = { createTask: () => undefined }
+    ;(server as unknown as { _registeredTools: Record<string, unknown> })._registeredTools.t = {
+      handler: taskHandler,
+    }
+    withDoclight(server, cfg(sink.baseUrl))
+    const tools = (server as unknown as { _registeredTools: Record<string, { handler: unknown }> })
+      ._registeredTools
+    expect(tools.t!.handler).toBe(taskHandler)
+  })
+
+  it("rejects a low-level Server-like object", () => {
+    expect(() => withDoclight({} as unknown as McpServer, cfg(sink.baseUrl))).toThrow(TypeError)
+  })
+
+  it("flush() and shutdown() are safe and idempotent", async () => {
+    const server = makeServer()
+    withDoclight(server, cfg(sink.baseUrl))
+    server.tool("t", async () => ({ content: [] }))
+    await callTool(server, "t")
+    const mcp = getDoclightMcp(server)!
+    await mcp.shutdown()
+    await mcp.shutdown()
+    expect(toolCalledEvents(sink)).toHaveLength(1)
+  })
+})
+
+describe("createDoclightMcp()", () => {
+  it("rejects batch sizes above the 500-event ingest limit", () => {
+    expect(() =>
+      createDoclightMcp({
+        apiKey: API_KEY,
+        projectId: PROJECT_ID,
+        transport: { batchSize: 501 },
+      }),
+    ).toThrow(RangeError)
   })
 })
