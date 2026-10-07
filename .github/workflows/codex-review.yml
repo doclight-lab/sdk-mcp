@@ -1,0 +1,36 @@
+name: Codex review coordinator
+on:
+  schedule:
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted]
+  issue_comment:
+    types: [created]
+permissions:
+  contents: read
+concurrency:
+  group: codex-review-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  evaluate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      # Only execute the controller from trusted main. Never checkout PR code
+      # in a job that has the merge PAT, including pull_request_target events.
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            if (require('node:fs').existsSync('.github/scripts/codex_merge.cjs')) {
+              await require('./.github/scripts/codex_merge.cjs').run({github, context, core});
+            } else {
+              core.info('Bootstrap: trusted controller is not yet on main; no merge attempted.');
+            }

@@ -1,0 +1,44 @@
+name: Doclight task automation
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+  issues:
+    types: [labeled, reopened, closed]
+  pull_request_target:
+    types: [opened, synchronize, closed, reopened]
+  pull_request_review:
+    types: [submitted]
+  workflow_run:
+    workflows: [Automation CI]
+    types: [completed]
+permissions:
+  contents: read
+concurrency:
+  group: doclight-task-automation-${{ github.repository }}
+  cancel-in-progress: false
+jobs:
+  coordinate:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: main
+          persist-credentials: false
+      - uses: actions/github-script@v8
+        env:
+          PROJECT_OWNER: ${{ vars.PROJECT_OWNER }}
+          PROJECT_NUMBER: ${{ vars.PROJECT_NUMBER }}
+          PROJECT_IN_PROGRESS_STATUS: ${{ vars.PROJECT_IN_PROGRESS_STATUS }}
+          PROJECT_IN_REVIEW_STATUS: ${{ vars.PROJECT_IN_REVIEW_STATUS }}
+          PROJECT_DONE_STATUS: ${{ vars.PROJECT_DONE_STATUS }}
+          CLAUDE_EXECUTION_MODE: ${{ vars.CLAUDE_EXECUTION_MODE }}
+          CLAUDE_ROUTINE_URL: ${{ vars.CLAUDE_ROUTINE_URL }}
+          CLAUDE_ROUTINE_TOKEN: ${{ secrets.CLAUDE_ROUTINE_TOKEN }}
+        with:
+          github-token: ${{ secrets.PROJECTS_TOKEN }}
+          script: |
+            if (require('node:fs').existsSync('.github/scripts/task_automation.cjs')) {
+              await require('./.github/scripts/task_automation.cjs').run({github,context,core});
+            } else core.info('Bootstrap: trusted task controller is not on main yet; no dispatch.');
