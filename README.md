@@ -106,3 +106,8 @@ Returns a `DoclightMcp` context. Lifecycle hooks are disabled by default so the 
 [Example MCP server →](https://github.com/doclight/doclight-example-mcp)
 
 [Full documentation →](https://doclight.app/docs)
+
+## Source and issues
+
+- Source: https://github.com/doclight-lab/sdk-mcp
+- Issues: https://github.com/doclight-lab/sdk-mcp/issues
